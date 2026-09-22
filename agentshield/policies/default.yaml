@@ -1,0 +1,57 @@
+version: "1.0"
+rules:
+  # Rule 1: Limit autonomous money transfers to 10,000
+  - id: "limit_autonomous_transfer"
+    description: "Cap autonomous transfers at 10,000 INR"
+    match:
+      action: "transfer_money"
+      conditions:
+        - field: "amount"
+          operator: "gt"
+          value: 10000
+    consequence:
+      type: "REQUIRE_APPROVAL"
+      approver_role: "manager"
+
+  # Rule 2: Block access to customer data export
+  - id: "block_customer_data_export"
+    description: "Never allow exporting full customer database"
+    match:
+      action: "export_customer_data"
+    consequence:
+      type: "BLOCK"
+
+  # Rule 3: Require approval for external emails
+  - id: "external_email_approval"
+    description: "External emails require approval"
+    match:
+      action: "send_email"
+      conditions:
+        - field: "recipient_domain"
+          operator: "not_in"
+          value: ["company.com", "internal.local"]
+    consequence:
+      type: "REQUIRE_APPROVAL"
+      approver_role: "supervisor"
+
+  # Rule 4: Allow small transfers automatically
+  - id: "allow_small_transfers"
+    description: "Transfers under 10,000 are allowed"
+    match:
+      action: "transfer_money"
+      conditions:
+        - field: "amount"
+          operator: "lte"
+          value: 10000
+    consequence:
+      type: "ALLOW"
+
+  # Rule 4: Default Deny (Catch-all) - Must be last
+  # This only applies if NO other rule matched
+  - id: "default_deny"
+    description: "Deny any action not explicitly allowed by other rules"
+    match:
+      action: "*"
+      conditions: []  # Empty conditions means it only matches if no other rule did
+    consequence:
+      type: "BLOCK"
