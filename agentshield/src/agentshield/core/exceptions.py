@@ -44,6 +44,11 @@ class AuditLoggingError(AgentShieldError):
     pass
 
 
+class ApprovalStorageError(AgentShieldError):
+    """Raised when approval storage operations fail."""
+    pass
+
+
 class ApprovalExpiredError(AuthorizationDeniedError):
     """Raised when an approval request has expired."""
     pass

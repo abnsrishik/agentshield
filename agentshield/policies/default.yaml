@@ -46,12 +46,5 @@ rules:
     consequence:
       type: "ALLOW"
 
-  # Rule 4: Default Deny (Catch-all) - Must be last
-  # This only applies if NO other rule matched
-  - id: "default_deny"
-    description: "Deny any action not explicitly allowed by other rules"
-    match:
-      action: "*"
-      conditions: []  # Empty conditions means it only matches if no other rule did
-    consequence:
-      type: "BLOCK"
+  # Note: No explicit default_deny rule needed.
+  # The engine implements deny-by-default implicitly when no rules match.
