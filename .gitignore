@@ -4,34 +4,30 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.egg-info/
 .Python
 env/
 venv/
 .venv/
 .ENV
-.python-version
-
-# Build/dist
-build/
-dist/
-*.egg
-*.whl
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Testing
-.coverage
-htmlcov/
-.tox/
-.nox/
-
-# Environment
 .env
 .env.local
-*.env.*
+.env.*
+.envrc
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage/
+htmlcov/
+*.cover
+.hypothesis/
+.python-version
 
-# Editors
+# Testing
+.tests/
+test/
+tests/
+
+# IDE
 .vscode/
 .idea/
 *.swp

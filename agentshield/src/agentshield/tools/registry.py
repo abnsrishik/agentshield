@@ -79,6 +79,7 @@ class ToolRegistry:
 class ToolValidator:
     """
     Validates action parameters against tool schemas.
+    Explicitly rejects undeclared parameters.
     """
 
     def __init__(self, registry: ToolRegistry):
@@ -103,6 +104,18 @@ class ToolValidator:
         
         # Get schema class
         schema_class = tool_def.parameter_schema
+        
+        # Check for extra undeclared fields BEFORE validation
+        # This satisfies requirement #4: ToolValidator explicitly rejects undeclared parameters
+        declared_fields = set(schema_class.model_fields.keys())
+        provided_fields = set(parameters.keys())
+        extra_fields = provided_fields - declared_fields
+        
+        if extra_fields:
+            raise ToolValidationError(
+                reason_code="EXTRA_FIELDS_NOT_ALLOWED",
+                message=f"Undeclared parameters for {action_name}: {extra_fields}"
+            )
         
         try:
             # Validate parameters

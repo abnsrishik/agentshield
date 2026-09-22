@@ -1,0 +1,17 @@
+pydantic>=2.0.0
+pyyaml>=6.0
+pyjwt>=2.8.0
+
+[demo]
+langgraph>=0.0.1
+langchain-core>=0.1.0
+
+[dev]
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+httpx>=0.24.0
+
+[server]
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
