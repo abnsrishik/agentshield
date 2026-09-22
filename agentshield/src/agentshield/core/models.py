@@ -107,15 +107,26 @@ class ToolDefinition(BaseModel):
 
 
 class ApprovalRequest(BaseModel):
-    """Immutable record of a pending approval."""
+    """
+    Immutable record of a pending approval.
+    
+    Security Properties:
+    - approval_id: Unique identity for the approval flow (primary key).
+    - request_hash: Integrity binding to the exact action parameters.
+    - used: One-time execution flag to prevent replay attacks.
+    """
     approval_id: UUID = Field(default_factory=uuid4)
-    request_hash: str = Field(..., description="SHA-256 of the canonical ActionRequest")
-    action_request_snapshot: Dict[str, Any] = Field(..., description="Snapshot of request details")
+    request_id: UUID = Field(..., description="Links to the original ActionRequest")
+    request_hash: str = Field(..., description="SHA-256 of canonical action request for integrity")
+    action_name: str
+    parameters: Dict[str, Any]
+    principal_snapshot: Dict[str, Any]  # Serialized principal for audit
     status: ApprovalStatus = ApprovalStatus.PENDING
     approver_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     expires_at: datetime
     decided_at: Optional[datetime] = None
+    used: bool = False  # Critical: Prevents replay attacks
 
     def is_expired(self) -> bool:
         return datetime.utcnow() > self.expires_at

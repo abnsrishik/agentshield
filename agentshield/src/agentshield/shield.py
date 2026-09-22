@@ -8,6 +8,7 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Optional, Type
 from pydantic import BaseModel
+from uuid import UUID
 
 from .core.models import (
     ActionRequest, Principal, PolicyDecision, DecisionType,
@@ -16,11 +17,12 @@ from .core.models import (
 from .core.exceptions import (
     AuthorizationDeniedError, ApprovalRequiredError, 
     IdentityVerificationError, ToolValidationError,
-    AuditLoggingError, ApprovalExpiredError, ApprovalTamperError
+    AuditLoggingError, ApprovalStorageError, ApprovalExpiredError, ApprovalTamperError
 )
 from .identity.verifier import IdentityVerifier
 from .tools.registry import ToolRegistry, ToolValidator
 from .policy.engine import PolicyEngine
+from .storage.database import DatabaseManager, ApprovalStore, AuditStore
 
 
 class AgentShield:
@@ -35,7 +37,7 @@ class AgentShield:
         self,
         policy_path: str,
         jwt_secret: str,
-        db_uri: str = "sqlite:///audit.db",
+        db_uri: str = "sqlite:///agentshield.db",
         approval_expiry_hours: int = 24
     ):
         """
@@ -54,13 +56,17 @@ class AgentShield:
         self.identity_verifier = IdentityVerifier(secret_key=jwt_secret)
         self.tool_registry = ToolRegistry()
         self.tool_validator = ToolValidator(self.tool_registry)
-        self.policy_engine = PolicyEngine(policy_path=policy_path)
         
-        # Initialize simple in-memory stores for MVP
-        # In production, these would be database-backed
-        self._approvals: Dict[str, ApprovalRequest] = {}
-        self._audit_log: list = []
-        self._db_uri = db_uri
+        # Load policies - fail closed if this fails
+        try:
+            self.policy_engine = PolicyEngine(policy_path=policy_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load policies: {e}") from e
+        
+        # Initialize persistent storage
+        self.db_manager = DatabaseManager(db_uri.replace("sqlite:///", ""))
+        self.approval_store = ApprovalStore(self.db_manager)
+        self.audit_store = AuditStore(self.db_manager)
 
     def register_tool(
         self,
@@ -93,7 +99,8 @@ class AgentShield:
         action: str,
         params: Dict[str, Any],
         auth_token: str,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
+        approval_id: Optional[str] = None  # For retrying after approval
     ) -> Any:
         """
         Main entry point: Execute an action with full governance.
@@ -102,15 +109,17 @@ class AgentShield:
         1. Verify Identity (AuthN)
         2. Validate Tool & Parameters
         3. Evaluate Policies (AuthZ)
-        4. Handle Approval if needed
+        4. Handle Approval if needed (or verify existing approval)
         5. Write Audit Log (Sync, Fail-Closed)
-        6. Execute Tool
+        6. Mark Approval as Used (if applicable)
+        7. Execute Tool
         
         Args:
             action: Name of the tool/action.
             params: Action parameters.
             auth_token: JWT authentication token.
             context: Optional environmental context.
+            approval_id: Optional approval ID for retry after approval.
             
         Returns:
             Result of the tool execution.
@@ -119,12 +128,12 @@ class AgentShield:
             AuthorizationDeniedError: If action is blocked.
             ApprovalRequiredError: If human approval is needed.
             ToolValidationError: If parameters are invalid.
+            ApprovalTamperError: If request doesn't match approved hash.
         """
         # Step 1: Verify Identity
         try:
             principal = self.identity_verifier.verify_token(auth_token)
         except IdentityVerificationError as e:
-            # Log attempt? (Careful not to log unverified data)
             raise AuthorizationDeniedError(
                 reason_code="IDENTITY_VERIFICATION_FAILED",
                 message="Invalid or missing authentication"
@@ -134,7 +143,6 @@ class AgentShield:
         try:
             validated_params = self.tool_validator.validate(action, params)
         except ToolValidationError as e:
-            # Synchronous audit for validation failures on sensitive tools
             self._write_audit_sync(
                 user_id=principal.user_id,
                 agent_id=principal.agent_id,
@@ -190,26 +198,22 @@ class AgentShield:
             )
 
         elif decision.decision == DecisionType.REQUIRE_APPROVAL:
-            # Create Approval Request
-            approval_req = self._create_approval_request(
+            return self._handle_approval_flow(
                 request=request,
-                approver_role=decision.required_approver_role
-            )
-            
-            # Check if already approved (polling scenario) - lookup by hash
-            existing_approval = self._approvals.get(approval_req.request_hash)
-            if existing_approval and existing_approval.status == ApprovalStatus.APPROVED:
-                # Already approved, proceed to execution immediately
-                return self._execute_tool(action, validated_params, principal, request, decision)
-            
-            # Return error to caller indicating approval needed
-            raise ApprovalRequiredError(
-                approval_id=str(approval_req.approval_id),
-                message=f"{decision.message}. Approval ID: {approval_req.approval_id}"
+                validated_params=validated_params,
+                principal=principal,
+                decision=decision,
+                provided_approval_id=approval_id
             )
 
         elif decision.decision == DecisionType.ALLOW:
-            return self._execute_tool(action, validated_params, principal, request, decision)
+            return self._execute_tool_after_checks(
+                action=action,
+                validated_params=validated_params,
+                principal=principal,
+                request=request,
+                decision=decision
+            )
         
         else:
             # Should not happen, but fail closed
@@ -218,49 +222,137 @@ class AgentShield:
                 message="Unknown policy decision result"
             )
 
-    def _create_approval_request(
-        self, 
-        request: ActionRequest, 
-        approver_role: Optional[str] = None
-    ) -> ApprovalRequest:
-        """Create and store an approval request."""
+    def _handle_approval_flow(
+        self,
+        request: ActionRequest,
+        validated_params: BaseModel,
+        principal: Principal,
+        decision: PolicyDecision,
+        provided_approval_id: Optional[str] = None
+    ) -> Any:
+        """
+        Handle the approval workflow with proper hash binding and replay prevention.
+        
+        If provided_approval_id is given, verify it exists and is approved.
+        Otherwise, create a new pending approval request.
+        """
         import json
         
         # Compute deterministic hash of the request content
         canonical = request.canonical_json()
         request_hash = hashlib.sha256(canonical.encode()).hexdigest()
         
-        # Check if identical request already exists (pending or approved)
-        if request_hash in self._approvals:
-            existing = self._approvals[request_hash]
-            if existing.status == ApprovalStatus.PENDING:
-                return existing  # Return existing pending request
-            elif existing.status == ApprovalStatus.APPROVED:
-                # Already approved - caller will execute directly
-                # Don't create a new record, just return the existing one
-                return existing
+        # Case 1: Retrying with an approval ID
+        if provided_approval_id:
+            try:
+                approval_uuid = UUID(provided_approval_id)
+            except ValueError:
+                raise ApprovalTamperError(
+                    reason_code="INVALID_APPROVAL_ID",
+                    message="Invalid approval ID format"
+                )
+            
+            # Retrieve approval from database
+            approval = self.approval_store.get_approval(approval_uuid)
+            
+            if not approval:
+                raise AuthorizationDeniedError(
+                    reason_code="APPROVAL_NOT_FOUND",
+                    message="Approval request not found"
+                )
+            
+            # Verify approval is approved
+            if approval.status != ApprovalStatus.APPROVED:
+                if approval.is_expired():
+                    raise ApprovalExpiredError(
+                        reason_code="APPROVAL_EXPIRED",
+                        message="Approval request has expired"
+                    )
+                raise ApprovalRequiredError(
+                    approval_id=provided_approval_id,
+                    message=f"Approval still pending. ID: {provided_approval_id}"
+                )
+            
+            # SECURITY CRITICAL: Verify request hash matches approved hash
+            if approval.request_hash != request_hash:
+                raise ApprovalTamperError(
+                    reason_code="REQUEST_HASH_MISMATCH",
+                    message="Request parameters do not match approved request. Potential tampering detected."
+                )
+            
+            # Verify approval hasn't been used (one-time use)
+            if approval.used:
+                raise AuthorizationDeniedError(
+                    reason_code="APPROVAL_ALREADY_USED",
+                    message="This approval has already been consumed. Replays are not allowed."
+                )
+            
+            # Mark as used atomically BEFORE execution
+            if not self.approval_store.mark_approval_used(approval_uuid):
+                raise AuthorizationDeniedError(
+                    reason_code="APPROVAL_CONSUMPTION_FAILED",
+                    message="Failed to mark approval as used. Possible concurrent access."
+                )
+            
+            # Write audit log synchronously
+            self._write_audit_sync(
+                user_id=principal.user_id,
+                agent_id=principal.agent_id,
+                action_name=request.action_name,
+                decision=DecisionType.ALLOW,
+                reason_code="APPROVAL_GRANTED",
+                params=request.parameters,
+                policy_version=decision.policy_version,
+                request_id=str(request.request_id),
+                approval_id=provided_approval_id
+            )
+            
+            # Execute tool
+            return self._execute_tool_after_checks(
+                action=request.action_name,
+                validated_params=validated_params,
+                principal=principal,
+                request=request,
+                decision=decision
+            )
         
-        # Create new approval request only if no existing record
+        # Case 2: Create new approval request
+        # Check if identical request already exists in DB (by hash)
+        existing_by_request = self.approval_store.get_approval_by_request_id(request.request_id)
+        if existing_by_request and existing_by_request.status == ApprovalStatus.PENDING:
+            # Return existing pending approval
+            raise ApprovalRequiredError(
+                approval_id=str(existing_by_request.approval_id),
+                message=f"{decision.message}. Approval ID: {existing_by_request.approval_id}"
+            )
+        
+        # Create new approval record
         expires_at = datetime.utcnow() + timedelta(hours=self.approval_expiry_hours)
         
         approval = ApprovalRequest(
+            request_id=request.request_id,
             request_hash=request_hash,
-            action_request_snapshot={
-                "action": request.action_name,
-                "params": request.parameters,
+            action_name=request.action_name,
+            parameters=request.parameters,
+            principal_snapshot={
                 "user_id": request.principal.user_id,
-                "agent_id": request.principal.agent_id
+                "agent_id": request.principal.agent_id,
+                "roles": request.principal.roles
             },
             status=ApprovalStatus.PENDING,
             expires_at=expires_at
         )
         
-        # Store by both hash and approval_id for different lookup patterns
-        self._approvals[request_hash] = approval
-        self._approvals[str(approval.approval_id)] = approval
-        return approval
-
-    def _execute_tool(
+        # Save to database
+        self.approval_store.save_approval(approval)
+        
+        # Return error indicating approval needed
+        raise ApprovalRequiredError(
+            approval_id=str(approval.approval_id),
+            message=f"{decision.message}. Approval ID: {approval.approval_id}"
+        )
+    
+    def _execute_tool_after_checks(
         self,
         action: str,
         validated_params: BaseModel,
@@ -282,7 +374,8 @@ class AgentShield:
                 decision=DecisionType.ALLOW,
                 reason_code=decision.reason_code,
                 params=request.parameters,
-                policy_version=decision.policy_version
+                policy_version=decision.policy_version,
+                request_id=str(request.request_id)
             )
         
         # Execute
@@ -297,7 +390,8 @@ class AgentShield:
                 decision=DecisionType.BLOCK,
                 reason_code="EXECUTION_ERROR",
                 params=request.parameters,
-                policy_version=decision.policy_version
+                policy_version=decision.policy_version,
+                request_id=str(request.request_id)
             )
             raise
         
@@ -310,7 +404,8 @@ class AgentShield:
                 decision=DecisionType.ALLOW,
                 reason_code=decision.reason_code,
                 params=request.parameters,
-                policy_version=decision.policy_version
+                policy_version=decision.policy_version,
+                request_id=str(request.request_id)
             )
         
         return result
@@ -330,6 +425,7 @@ class AgentShield:
         """
         Synchronously write audit event.
         Fail-closed: If this fails, sensitive actions should be blocked.
+        Raises AuditLoggingError on failure.
         """
         import json
         
@@ -350,6 +446,10 @@ class AgentShield:
             json.dumps(params, sort_keys=True).encode()
         ).hexdigest()
         
+        # Parse UUIDs if strings provided
+        req_uuid = UUID(request_id) if request_id else None
+        appr_uuid = UUID(approval_id) if approval_id else None
+        
         event = AuditEvent(
             user_id=user_id,
             agent_id=agent_id,
@@ -358,57 +458,81 @@ class AgentShield:
             policy_version=policy_version,
             parameter_hash=param_hash,
             redacted_fields=redacted_list,
-            request_id=request_id,
-            approval_id=approval_id
+            request_id=req_uuid,
+            approval_id=appr_uuid
         )
         
-        # In-memory storage for MVP (replace with SQLite in Phase 7)
-        self._audit_log.append(event)
-        
-        # Simulate potential DB failure for testing
-        # In real implementation: try/except around DB write
-        # If exception: raise AuditLoggingError which triggers BLOCK
+        # Write to SQLite database - fail closed on error
+        try:
+            self.audit_store.save_audit_event(event)
+        except AuditLoggingError as e:
+            # Re-raise to trigger blocking behavior
+            raise e
+        except Exception as e:
+            raise AuditLoggingError(f"Audit logging failed: {e}") from e
 
     def check_approval_status(self, approval_id: str) -> ApprovalStatus:
         """Check the status of an approval request."""
-        for approval in self._approvals.values():
-            if str(approval.approval_id) == approval_id:
-                if approval.is_expired():
-                    approval.status = ApprovalStatus.EXPIRED
-                return approval.status
-        raise ValueError(f"Approval ID not found: {approval_id}")
+        try:
+            approval_uuid = UUID(approval_id)
+        except ValueError:
+            raise ValueError(f"Invalid approval ID format: {approval_id}")
+        
+        approval = self.approval_store.get_approval(approval_uuid)
+        if not approval:
+            raise ValueError(f"Approval ID not found: {approval_id}")
+        
+        if approval.is_expired():
+            return ApprovalStatus.EXPIRED
+        return approval.status
 
     def approve_request(self, approval_id: str, approver_id: str) -> bool:
-        """Approve a pending request."""
-        for approval in self._approvals.values():
-            if str(approval.approval_id) == approval_id:
-                if not approval.can_transition_to(ApprovalStatus.APPROVED):
-                    return False
-                approval.status = ApprovalStatus.APPROVED
-                approval.approver_id = approver_id
-                approval.decided_at = datetime.utcnow()
-                return True
-        return False
+        """Approve a pending request via admin interface."""
+        try:
+            approval_uuid = UUID(approval_id)
+        except ValueError:
+            return False
+        
+        approval = self.approval_store.get_approval(approval_uuid)
+        if not approval:
+            return False
+        
+        if not approval.can_transition_to(ApprovalStatus.APPROVED):
+            return False
+        
+        # Update status atomically (not marking as used yet - that happens on execution)
+        return self.approval_store.update_approval_status(
+            approval_id=approval_uuid,
+            status=ApprovalStatus.APPROVED,
+            approver_id=approver_id,
+            used=False  # Marked as used only during execution
+        )
 
     def reject_request(self, approval_id: str, approver_id: str) -> bool:
-        """Reject a pending request."""
-        for approval in self._approvals.values():
-            if str(approval.approval_id) == approval_id:
-                if not approval.can_transition_to(ApprovalStatus.REJECTED):
-                    return False
-                approval.status = ApprovalStatus.REJECTED
-                approval.approver_id = approver_id
-                approval.decided_at = datetime.utcnow()
-                return True
-        return False
+        """Reject a pending request via admin interface."""
+        try:
+            approval_uuid = UUID(approval_id)
+        except ValueError:
+            return False
+        
+        approval = self.approval_store.get_approval(approval_uuid)
+        if not approval:
+            return False
+        
+        if not approval.can_transition_to(ApprovalStatus.REJECTED):
+            return False
+        
+        return self.approval_store.update_approval_status(
+            approval_id=approval_uuid,
+            status=ApprovalStatus.REJECTED,
+            approver_id=approver_id,
+            used=False
+        )
 
     def get_pending_approvals(self) -> list:
         """Get all pending approvals."""
-        return [
-            a for a in self._approvals.values() 
-            if a.status == ApprovalStatus.PENDING and not a.is_expired()
-        ]
+        return self.approval_store.get_pending_approvals()
 
-    def get_audit_logs(self) -> list:
-        """Get all audit logs."""
-        return self._audit_log
+    def get_audit_logs(self, limit: int = 100, offset: int = 0) -> list:
+        """Get audit logs with pagination."""
+        return self.audit_store.get_audit_events(limit=limit, offset=offset)

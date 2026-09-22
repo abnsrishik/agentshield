@@ -16,19 +16,31 @@ from ..core.models import ActionRequest, PolicyDecision, DecisionType, Principal
 from ..core.exceptions import PolicyEvaluationError
 
 
+# Sentinel value to distinguish "field missing" from "field exists with value None"
+class _MissingSentinel:
+    """Sentinel class for MISSING field values."""
+    def __repr__(self):
+        return "<MISSING>"
+    
+    def __bool__(self):
+        return False
+
+MISSING = _MissingSentinel()
+
+
 class PolicyCondition:
     """Represents a single condition in a policy rule."""
     
     SUPPORTED_OPERATORS = {
-        'eq': lambda a, b: a == b,
-        'neq': lambda a, b: a != b,
-        'gt': lambda a, b: a > b if isinstance(a, (int, float)) else False,
-        'gte': lambda a, b: a >= b if isinstance(a, (int, float)) else False,
-        'lt': lambda a, b: a < b if isinstance(a, (int, float)) else False,
-        'lte': lambda a, b: a <= b if isinstance(a, (int, float)) else False,
-        'in': lambda a, b: a in b if isinstance(b, (list, tuple)) else False,
-        'not_in': lambda a, b: a not in b if isinstance(b, (list, tuple)) else True,
-        'exists': lambda a, b: a is not None,
+        'eq': lambda a, b: a == b if a is not MISSING else False,
+        'neq': lambda a, b: a != b if a is not MISSING else True,
+        'gt': lambda a, b: a > b if isinstance(a, (int, float)) and a is not MISSING else False,
+        'gte': lambda a, b: a >= b if isinstance(a, (int, float)) and a is not MISSING else False,
+        'lt': lambda a, b: a < b if isinstance(a, (int, float)) and a is not MISSING else False,
+        'lte': lambda a, b: a <= b if isinstance(a, (int, float)) and a is not MISSING else False,
+        'in': lambda a, b: a in b if isinstance(b, (list, tuple)) and a is not MISSING else False,
+        'not_in': lambda a, b: a not in b if isinstance(b, (list, tuple)) and a is not MISSING else True,
+        'exists': lambda a, b: a is not MISSING,  # True if field exists (even if None)
     }
 
     def __init__(self, field: str, operator: str, value: Any = None):
@@ -52,7 +64,11 @@ class PolicyCondition:
 
     @staticmethod
     def _get_field_value(data: Dict[str, Any], field_path: str) -> Any:
-        """Get value from nested dictionary using dot notation."""
+        """Get value from nested dictionary using dot notation.
+        
+        Returns MISSING sentinel if field doesn't exist, 
+        distinguishing from field existing with None value.
+        """
         keys = field_path.split('.')
         current = data
         
@@ -60,9 +76,9 @@ class PolicyCondition:
             if isinstance(current, dict) and key in current:
                 current = current[key]
             else:
-                return None
+                return MISSING  # Field doesn't exist
         
-        return current
+        return current  # Could be None, but field exists
 
 
 class PolicyRule:
