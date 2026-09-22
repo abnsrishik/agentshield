@@ -1,4 +1,3 @@
-```
 # Python
 __pycache__/
 *.pyc
@@ -20,13 +19,12 @@ coverage/
 dist/
 build/
 *.egg-info/
+*.egg-info
 .installed.cfg
 *.egg
 
 # Testing
 .tests/
-test/
-tests/
 
 # IDE and editor files
 .vscode/
@@ -44,4 +42,4 @@ Thumbs.db
 .env
 .env.local
 *.env.*
-```
+*.db

@@ -35,6 +35,9 @@ INTERNAL_AUTH_TOKEN = os.environ.get("AGENTSHIELD_GATEWAY_TOKEN", "gateway-secre
 app = FastAPI(title="AgentShield Protected Tool Gateway")
 
 
+import hashlib
+import json
+
 # Request/Response Models
 class TransferRequest(BaseModel):
     amount: float = Field(gt=0)
@@ -46,6 +49,10 @@ class EmailRequest(BaseModel):
     to: str
     subject: str
     body: str
+
+
+class CustomerLookupRequest(BaseModel):
+    customer_id: str
 
 
 class CustomerSearchRequest(BaseModel):
@@ -63,6 +70,11 @@ class GatewayResponse(BaseModel):
 _idempotency_store: Dict[str, Dict] = {}
 
 
+def _compute_param_hash(params: Dict) -> str:
+    """Compute deterministic SHA-256 hash of parameters."""
+    return hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def verify_internal_auth(x_agentshield_auth: Optional[str] = Header(None, alias="X-AgentShield-Auth")) -> str:
     """Verify internal authentication token."""
     if not x_agentshield_auth:
@@ -78,8 +90,9 @@ def check_idempotency(request_id: str, tool_name: str, params: Dict) -> Optional
     """Check if request was already processed (idempotency)."""
     if request_id in _idempotency_store:
         stored = _idempotency_store[request_id]
+        param_hash = _compute_param_hash(params)
         # Verify the tool and params match (prevent replay with different params)
-        if stored["tool"] == tool_name and stored["params_hash"] == hash(str(sorted(params.items()))):
+        if stored["tool"] == tool_name and stored["params_hash"] == param_hash:
             return stored["result"]
         else:
             raise HTTPException(
@@ -93,16 +106,17 @@ def store_idempotency(request_id: str, tool_name: str, params: Dict, result: Dic
     """Store request for idempotency checking."""
     _idempotency_store[request_id] = {
         "tool": tool_name,
-        "params_hash": hash(str(sorted(params.items()))),
+        "params_hash": _compute_param_hash(params),
         "result": result,
         "timestamp": datetime.now(timezone.utc)
     }
 
 
-@app.post("/health")
+@app.api_route("/health", methods=["GET", "POST"])
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
 
 
 @app.post("/tools/transfer_money", response_model=GatewayResponse)
@@ -165,7 +179,7 @@ async def get_customer_info(
     customer_id: str,
     auth_token: str = Depends(verify_internal_auth)
 ):
-    """Get customer information (protected operation)."""
+    """Get customer information via GET (protected operation)."""
     request_id = f"get-customer-{customer_id}-{uuid.uuid4()}"
     
     try:
@@ -177,6 +191,32 @@ async def get_customer_info(
                 request_id=request_id
             )
         
+        return GatewayResponse(success=True, result=customer, request_id=request_id)
+    except Exception as e:
+        return GatewayResponse(success=False, error=str(e), request_id=request_id)
+
+
+@app.post("/tools/customer", response_model=GatewayResponse)
+async def get_customer_post(
+    request: CustomerLookupRequest,
+    request_id: str,
+    auth_token: str = Depends(verify_internal_auth)
+):
+    """Get customer information via POST (protected operation)."""
+    cached = check_idempotency(request_id, "get_customer", request.model_dump())
+    if cached:
+        return GatewayResponse(success=True, result=cached, request_id=request_id)
+
+    try:
+        customer = get_customer(request.customer_id)
+        if not customer:
+            return GatewayResponse(
+                success=False,
+                error=f"Customer {request.customer_id} not found",
+                request_id=request_id
+            )
+
+        store_idempotency(request_id, "get_customer", request.model_dump(), customer)
         return GatewayResponse(success=True, result=customer, request_id=request_id)
     except Exception as e:
         return GatewayResponse(success=False, error=str(e), request_id=request_id)
@@ -205,20 +245,29 @@ async def search_customers_endpoint(
         return GatewayResponse(success=False, error=str(e), request_id=request_id)
 
 
-@app.get("/tools/export_customers", response_model=GatewayResponse)
+@app.api_route("/tools/export_customers", methods=["GET", "POST"], response_model=GatewayResponse)
 async def export_customers_endpoint(
+    request_id: Optional[str] = None,
     auth_token: str = Depends(verify_internal_auth)
 ):
     """Export all customer data (highly restricted operation)."""
-    request_id = f"export-customers-{uuid.uuid4()}"
-    
+    req_id = request_id or f"export-customers-{uuid.uuid4()}"
+
+    if request_id:
+        cached = check_idempotency(request_id, "export_customer_data", {})
+        if cached:
+            return GatewayResponse(success=True, result=cached, request_id=req_id)
+
     try:
         customers = export_customer_data()
         result = {"customers": customers, "count": len(customers)}
-        
-        return GatewayResponse(success=True, result=result, request_id=request_id)
+
+        if request_id:
+            store_idempotency(request_id, "export_customer_data", {}, result)
+
+        return GatewayResponse(success=True, result=result, request_id=req_id)
     except Exception as e:
-        return GatewayResponse(success=False, error=str(e), request_id=request_id)
+        return GatewayResponse(success=False, error=str(e), request_id=req_id)
 
 
 @app.post("/admin/reset", response_model=GatewayResponse)

@@ -1,5 +1,5 @@
 """Adapters package."""
 
-from .gateway_executor import GatewayExecutor
+from .gateway_executor import BaseToolExecutor, GatewayExecutor, LocalExecutor
 
-__all__ = ["GatewayExecutor"]
+__all__ = ["BaseToolExecutor", "GatewayExecutor", "LocalExecutor"]

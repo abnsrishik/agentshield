@@ -5,11 +5,12 @@ Defines protected tools with strict parameter schemas.
 Validates inputs before policy evaluation.
 """
 
-from typing import Any, Callable, Dict, Type
+from typing import Any, Callable, Dict, Type, Optional
 from pydantic import BaseModel, ValidationError
 
 from ..core.models import ToolDefinition, SensitivityLevel, ActionRequest
 from ..core.exceptions import ToolValidationError
+from ..adapters.gateway_executor import BaseToolExecutor, LocalExecutor
 
 
 class ToolRegistry:
@@ -20,15 +21,17 @@ class ToolRegistry:
     def __init__(self):
         self._tools: Dict[str, ToolDefinition] = {}
         self._executors: Dict[str, Callable] = {}
+        self._strategies: Dict[str, BaseToolExecutor] = {}
 
     def register(
         self,
         name: str,
         schema: Type[BaseModel],
-        executor: Callable[[Any], Any],
+        executor: Optional[Callable[[Any], Any]] = None,
         description: str = "",
         sensitivity_level: SensitivityLevel = SensitivityLevel.MEDIUM,
-        endpoint: str = None
+        endpoint: Optional[str] = None,
+        executor_strategy: Optional[BaseToolExecutor] = None
     ):
         """
         Register a protected tool.
@@ -36,10 +39,11 @@ class ToolRegistry:
         Args:
             name: Unique tool identifier.
             schema: Pydantic model class for parameter validation.
-            executor: Function to execute the tool.
+            executor: Optional local function to execute the tool (testing adapter).
             description: Human-readable description.
             sensitivity_level: Risk classification.
             endpoint: Optional gateway endpoint.
+            executor_strategy: Optional custom execution strategy (e.g. GatewayExecutor).
         """
         if name in self._tools:
             raise ValueError(f"Tool '{name}' is already registered")
@@ -51,7 +55,11 @@ class ToolRegistry:
             sensitivity_level=sensitivity_level,
             endpoint=endpoint
         )
-        self._executors[name] = executor
+        if executor is not None:
+            self._executors[name] = executor
+            self._strategies[name] = LocalExecutor(executor)
+        if executor_strategy is not None:
+            self._strategies[name] = executor_strategy
 
     def get_tool(self, name: str) -> ToolDefinition:
         """Get tool definition by name."""
@@ -71,9 +79,23 @@ class ToolRegistry:
             )
         return self._executors[name]
 
+    def get_executor_strategy(self, name: str) -> Optional[BaseToolExecutor]:
+        """Get tool execution strategy by name."""
+        if name not in self._tools:
+            raise ToolValidationError(
+                reason_code="UNKNOWN_TOOL",
+                message=f"Unknown tool: {name}"
+            )
+        return self._strategies.get(name)
+
     def has_tool(self, name: str) -> bool:
         """Check if tool is registered."""
         return name in self._tools
+
+    def has_executor(self, name: str) -> bool:
+        """Check if an executor or strategy is registered for this tool."""
+        return name in self._executors or name in self._strategies
+
 
 
 class ToolValidator:

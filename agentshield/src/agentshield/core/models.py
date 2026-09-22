@@ -129,7 +129,13 @@ class ApprovalRequest(BaseModel):
     used: bool = False  # Critical: Prevents replay attacks
 
     def is_expired(self) -> bool:
-        return datetime.utcnow() > self.expires_at
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        expires = self.expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return now > expires
+
 
     def can_transition_to(self, new_status: ApprovalStatus) -> bool:
         if self.status != ApprovalStatus.PENDING:

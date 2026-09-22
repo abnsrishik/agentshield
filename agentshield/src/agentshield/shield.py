@@ -4,6 +4,7 @@ AgentShield Main SDK.
 The core entry point for intercepting and governing AI agent actions.
 """
 
+import os
 import hashlib
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Optional, Type
@@ -17,12 +18,14 @@ from .core.models import (
 from .core.exceptions import (
     AuthorizationDeniedError, ApprovalRequiredError, 
     IdentityVerificationError, ToolValidationError,
-    AuditLoggingError, ApprovalStorageError, ApprovalExpiredError, ApprovalTamperError
+    AuditLoggingError, ApprovalStorageError, ApprovalExpiredError, ApprovalTamperError,
+    ToolExecutionError, GatewayConnectionError
 )
 from .identity.verifier import IdentityVerifier
 from .tools.registry import ToolRegistry, ToolValidator
 from .policy.engine import PolicyEngine
 from .storage.database import DatabaseManager, ApprovalStore, AuditStore
+from .adapters.gateway_executor import BaseToolExecutor, GatewayExecutor, LocalExecutor
 
 
 class AgentShield:
@@ -38,7 +41,10 @@ class AgentShield:
         policy_path: str,
         jwt_secret: str,
         db_uri: str = "sqlite:///agentshield.db",
-        approval_expiry_hours: int = 24
+        approval_expiry_hours: int = 24,
+        gateway_url: Optional[str] = None,
+        gateway_token: Optional[str] = None,
+        gateway_executor: Optional[BaseToolExecutor] = None,
     ):
         """
         Initialize AgentShield.
@@ -48,6 +54,9 @@ class AgentShield:
             jwt_secret: Secret key for JWT verification.
             db_uri: Database URI for audit/approval storage.
             approval_expiry_hours: Hours before pending approvals expire.
+            gateway_url: URL to Protected Tool Gateway service.
+            gateway_token: Internal token for Protected Tool Gateway auth.
+            gateway_executor: Optional custom BaseToolExecutor instance.
         """
         self.jwt_secret = jwt_secret
         self.approval_expiry_hours = approval_expiry_hours
@@ -57,6 +66,19 @@ class AgentShield:
         self.tool_registry = ToolRegistry()
         self.tool_validator = ToolValidator(self.tool_registry)
         
+        # Initialize gateway executor strategy
+        if gateway_executor is not None:
+            self.gateway_executor = gateway_executor
+        elif gateway_url is not None:
+            self.gateway_executor = GatewayExecutor(
+                base_url=gateway_url,
+                auth_token=gateway_token or os.environ.get("AGENTSHIELD_GATEWAY_TOKEN", "gateway-secret-token-mvp")
+            )
+        else:
+            default_url = os.environ.get("AGENTSHIELD_GATEWAY_URL", "http://127.0.0.1:8001")
+            default_token = gateway_token or os.environ.get("AGENTSHIELD_GATEWAY_TOKEN", "gateway-secret-token-mvp")
+            self.gateway_executor = GatewayExecutor(base_url=default_url, auth_token=default_token)
+
         # Load policies - fail closed if this fails
         try:
             self.policy_engine = PolicyEngine(policy_path=policy_path)
@@ -72,9 +94,11 @@ class AgentShield:
         self,
         name: str,
         schema: Type[BaseModel],
-        executor: Callable[[Any], Any],
+        executor: Optional[Callable[[Any], Any]] = None,
         description: str = "",
-        sensitivity_level: SensitivityLevel = SensitivityLevel.MEDIUM
+        sensitivity_level: SensitivityLevel = SensitivityLevel.MEDIUM,
+        endpoint: Optional[str] = None,
+        executor_strategy: Optional[BaseToolExecutor] = None
     ):
         """
         Register a protected tool.
@@ -82,16 +106,20 @@ class AgentShield:
         Args:
             name: Unique tool identifier.
             schema: Pydantic model for parameter validation.
-            executor: Function to execute the tool.
+            executor: Optional local function to execute the tool (testing adapter).
             description: Human-readable description.
             sensitivity_level: Risk classification.
+            endpoint: Optional custom gateway endpoint.
+            executor_strategy: Optional custom BaseToolExecutor strategy.
         """
         self.tool_registry.register(
             name=name,
             schema=schema,
             executor=executor,
             description=description,
-            sensitivity_level=sensitivity_level
+            sensitivity_level=sensitivity_level,
+            endpoint=endpoint,
+            executor_strategy=executor_strategy
         )
 
     def execute(
@@ -261,17 +289,20 @@ class AgentShield:
                     message="Approval request not found"
                 )
             
+            # Check expiration first
+            if approval.is_expired():
+                raise ApprovalExpiredError(
+                    reason_code="APPROVAL_EXPIRED",
+                    message="Approval request has expired"
+                )
+
             # Verify approval is approved
             if approval.status != ApprovalStatus.APPROVED:
-                if approval.is_expired():
-                    raise ApprovalExpiredError(
-                        reason_code="APPROVAL_EXPIRED",
-                        message="Approval request has expired"
-                    )
                 raise ApprovalRequiredError(
                     approval_id=provided_approval_id,
                     message=f"Approval still pending. ID: {provided_approval_id}"
                 )
+
             
             # SECURITY CRITICAL: Verify request hash matches approved hash
             if approval.request_hash != request_hash:
@@ -313,7 +344,8 @@ class AgentShield:
                 validated_params=validated_params,
                 principal=principal,
                 request=request,
-                decision=decision
+                decision=decision,
+                approval_id=provided_approval_id
             )
         
         # Case 2: Create new approval request
@@ -358,15 +390,17 @@ class AgentShield:
         validated_params: BaseModel,
         principal: Principal,
         request: ActionRequest,
-        decision: PolicyDecision
+        decision: PolicyDecision,
+        approval_id: Optional[str] = None
     ) -> Any:
         """Execute the tool after all checks pass."""
-        # Get executor
-        executor = self.tool_registry.get_executor(action)
-        
-        # Pre-execution audit (synchronous for HIGH sensitivity)
         tool_def = self.tool_registry.get_tool(action)
-        if tool_def.sensitivity_level == SensitivityLevel.HIGH:
+
+        # Pre-execution audit:
+        # If approval_id is present, it was already audited synchronously in _handle_approval_flow.
+        # Otherwise, synchronous pre-execution audit for ALLOW decision.
+        # Fail-closed: If audit logging fails, execution is aborted.
+        if approval_id is None:
             self._write_audit_sync(
                 user_id=principal.user_id,
                 agent_id=principal.agent_id,
@@ -377,12 +411,30 @@ class AgentShield:
                 policy_version=decision.policy_version,
                 request_id=str(request.request_id)
             )
-        
-        # Execute
+
+        # Resolve executor strategy:
+        # 1. Custom strategy registered for tool
+        # 2. Local callable adapter registered for tool
+        # 3. Default GatewayExecutor
+        executor_strategy = self.tool_registry.get_executor_strategy(action)
+        if executor_strategy is None and self.tool_registry.has_executor(action):
+            local_fn = self.tool_registry.get_executor(action)
+            executor_strategy = LocalExecutor(local_fn)
+        if executor_strategy is None and self.gateway_executor is not None:
+            executor_strategy = self.gateway_executor
+        if executor_strategy is None:
+            raise ToolExecutionError(f"No execution strategy configured for tool: {action}")
+
+        # Execute via selected strategy
         try:
-            result = executor(validated_params)
+            result = executor_strategy.execute(
+                tool_name=action,
+                parameters=request.parameters,
+                request_id=str(request.request_id),
+                validated_params=validated_params
+            )
         except Exception as e:
-            # Execution failed
+            # Execution failed - write audit event
             self._write_audit_sync(
                 user_id=principal.user_id,
                 agent_id=principal.agent_id,
@@ -391,23 +443,11 @@ class AgentShield:
                 reason_code="EXECUTION_ERROR",
                 params=request.parameters,
                 policy_version=decision.policy_version,
-                request_id=str(request.request_id)
+                request_id=str(request.request_id),
+                approval_id=approval_id
             )
             raise
-        
-        # Post-execution audit for non-HIGH sensitivity
-        if tool_def.sensitivity_level != SensitivityLevel.HIGH:
-            self._write_audit_sync(
-                user_id=principal.user_id,
-                agent_id=principal.agent_id,
-                action_name=action,
-                decision=DecisionType.ALLOW,
-                reason_code=decision.reason_code,
-                params=request.parameters,
-                policy_version=decision.policy_version,
-                request_id=str(request.request_id)
-            )
-        
+
         return result
 
     def _write_audit_sync(
