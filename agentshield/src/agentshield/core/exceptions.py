@@ -57,3 +57,13 @@ class ApprovalExpiredError(AuthorizationDeniedError):
 class ApprovalTamperError(AuthorizationDeniedError):
     """Raised when request parameters do not match approved hash."""
     pass
+
+
+class GatewayConnectionError(AgentShieldError):
+    """Raised when gateway connection fails."""
+    pass
+
+
+class ToolExecutionError(AgentShieldError):
+    """Raised when tool execution fails."""
+    pass
